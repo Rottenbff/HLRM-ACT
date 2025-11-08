@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from model import HRMACTInner
-from sudoku import load_online_puzzle, generate_sudoku, Difficulty
+from sudoku import load_online_puzzle, generate_sudoku, Difficulty, load_sapient_sudoku_dataset
 import random
 import multiprocessing
 
