@@ -195,6 +195,3 @@ if __name__ == "__main__":
         train(use_sapient=getattr(args, 'use_sapient', False))
     elif args.command == "infer":
         infer(args.checkpoint, args.difficulty, args.turns, args.verbose)
-
-
-def train(use_sapient=False):
