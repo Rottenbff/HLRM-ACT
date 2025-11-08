@@ -11,7 +11,7 @@ from train import TrainingBatch, train_step
 from sudoku import generate_sudoku, Difficulty, sudoku_board_string
 from adam_atan2_pytorch import AdamAtan2 # adam-atan2-pytorch
 
-def train():
+def train(use_sapient=False, use_arc_agi=False, arc_agi_config=None):
     # Setup device - CUDA if available, otherwise CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -20,23 +20,57 @@ def train():
         device = torch.device("cpu")
         print("Using CPU")
 
-    # Model configuration
-    config = HRMACTModelConfig(
-        seq_len=81,
-        vocab_size=10,
-        high_level_cycles=2,
-        low_level_cycles=2,
-        transformers=HRMACTModelConfig.TransformerConfig(
-            num_layers=4,
-            hidden_size=256,
-            num_heads=4,
-            expansion=4
-        ),
-        act=HRMACTModelConfig.ACTConfig(
-            halt_max_steps=16,
-            halt_exploration_probability=0.1
+    if use_arc_agi:
+        # ARC-AGI configuration
+        if arc_agi_config is None:
+            arc_agi_config = {
+                'max_seq_len': max_seq_len,  # User specified max seq len
+                'target_seq_len': max_seq_len,
+                'vocab_size': 12,  # PAD(0) + EOS(1) + digits 2-11
+                'high_level_cycles': 2,
+                'low_level_cycles': 2,
+                'num_layers': 4,
+                'hidden_size': 256,
+                'num_heads': 4,
+                'expansion': 4
+            }
+        
+        config = HRMACTModelConfig(
+            max_seq_len=arc_agi_config['max_seq_len'],
+            target_seq_len=arc_agi_config['target_seq_len'],
+            vocab_size=arc_agi_config['vocab_size'],
+            high_level_cycles=arc_agi_config['high_level_cycles'],
+            low_level_cycles=arc_agi_config['low_level_cycles'],
+            transformers=HRMACTModelConfig.TransformerConfig(
+                num_layers=arc_agi_config['num_layers'],
+                hidden_size=arc_agi_config['hidden_size'],
+                num_heads=arc_agi_config['num_heads'],
+                expansion=arc_agi_config['expansion']
+            ),
+            act=HRMACTModelConfig.ACTConfig(
+                halt_max_steps=16,
+                halt_exploration_probability=0.1
+            )
         )
-    )
+    else:
+        # Sudoku configuration
+        config = HRMACTModelConfig(
+            max_seq_len=81,
+            target_seq_len=81,
+            vocab_size=10,
+            high_level_cycles=2,
+            low_level_cycles=2,
+            transformers=HRMACTModelConfig.TransformerConfig(
+                num_layers=4,
+                hidden_size=256,
+                num_heads=4,
+                expansion=4
+            ),
+            act=HRMACTModelConfig.ACTConfig(
+                halt_max_steps=16,
+                halt_exploration_probability=0.1
+            )
+        )
 
     # Initialize model and move to device
     torch.manual_seed(42)
@@ -47,7 +81,16 @@ def train():
     optimizer = AdamAtan2(model.parameters(), lr=1e-4, betas=(0.9, 0.95))
 
     # Training batch
-    batch = TrainingBatch(model, batch_size=128, device=device, shard="train[:1%]")
+    if use_arc_agi:
+        print("Using ARC-AGI dataset")
+        batch = TrainingBatch(model, batch_size=64, device=device, use_arc_agi=True)
+    elif use_sapient:
+        print("Using sapientinc/sudoku-extreme dataset")
+        print("WARNING: Using small subset to avoid overfitting (100 base puzzles)")
+        batch = TrainingBatch(model, batch_size=128, device=device, use_sapient=True, subsample_size=100)
+    else:
+        print("Using Ritvik19/Sudoku-Dataset")
+        batch = TrainingBatch(model, batch_size=128, device=device, shard="train[:1%]")
 
     step_idx = 0
     steps_since_graduation = 0
@@ -83,7 +126,11 @@ def infer(checkpoint_path, difficulty_str, turns = 1, verbose = False):
 
     # Config
     config = HRMACTModelConfig(
-        seq_len=81, vocab_size=10, high_level_cycles=2, low_level_cycles=2,
+        max_seq_len=81,
+        target_seq_len=81,
+        vocab_size=10, 
+        high_level_cycles=2, 
+        low_level_cycles=2,
         transformers=HRMACTModelConfig.TransformerConfig(num_layers=4, hidden_size=256, num_heads=4, expansion=4),
         act=HRMACTModelConfig.ACTConfig(halt_max_steps=16, halt_exploration_probability=0.1)
     )
@@ -122,8 +169,8 @@ def infer(checkpoint_path, difficulty_str, turns = 1, verbose = False):
         puzzle_tensor = torch.tensor(puzzle.flatten(), dtype=torch.long, device=device).unsqueeze(0)
 
         # Initial hidden states
-        low_h = model.initial_low_level.unsqueeze(0).expand(1, config.seq_len + 1, -1)
-        high_h = model.initial_high_level.unsqueeze(0).expand(1, config.seq_len + 1, -1)
+        low_h = model.initial_low_level.unsqueeze(0).expand(1, config.max_seq_len + 1, -1)
+        high_h = model.initial_high_level.unsqueeze(0).expand(1, config.max_seq_len + 1, -1)
         hidden_states = (low_h, high_h)
 
         with torch.no_grad():
@@ -173,6 +220,14 @@ if __name__ == "__main__":
 
     # Train command
     parser_train = subparsers.add_parser("train", help="Train the model")
+    parser_train.add_argument("--use-sapient", action="store_true",
+                              help="Use sapientinc/sudoku-extreme dataset instead of Ritvik19")
+    parser_train.add_argument("--arc-agi", action="store_true",
+                              help="Use ARC-AGI dataset instead of Sudoku")
+    parser_train.add_argument("--max-seq-len", type=int, default=900,
+                              help="Maximum sequence length for ARC-AGI (default: 900)")
+    parser_train.add_argument("--batch-size", type=int, default=None,
+                              help="Batch size for training (default: 64 for ARC-AGI, 128 for Sudoku)")
 
     # Infer command
     parser_infer = subparsers.add_parser("infer", help="Run inference with a trained model")
@@ -185,6 +240,25 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "train":
-        train()
+        use_sapient = getattr(args, 'use_sapient', False)
+        use_arc_agi = getattr(args, 'arc_agi', False)
+        max_seq_len = getattr(args, 'max_seq_len', 900)
+        batch_size = getattr(args, 'batch_size', None)
+        
+        arc_agi_config = None
+        if use_arc_agi:
+            arc_agi_config = {
+                'max_seq_len': max_seq_len + 1,  # +1 for class token
+                'target_seq_len': max_seq_len,
+                'vocab_size': 12,  # PAD(0) + EOS(1) + digits 2-11
+                'high_level_cycles': 2,
+                'low_level_cycles': 2,
+                'num_layers': 4,
+                'hidden_size': 256,
+                'num_heads': 4,
+                'expansion': 4
+            }
+        
+        train(use_sapient=use_sapient, use_arc_agi=use_arc_agi, arc_agi_config=arc_agi_config)
     elif args.command == "infer":
         infer(args.checkpoint, args.difficulty, args.turns, args.verbose)

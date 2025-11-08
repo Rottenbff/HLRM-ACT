@@ -22,7 +22,9 @@ class HRMACTModelConfig:
         halt_max_steps: int
         halt_exploration_probability: float
 
-    seq_len: int
+    # For variable sequence length support
+    max_seq_len: int  # Maximum sequence length this model can handle
+    target_seq_len: int  # Current target sequence length (padded to this)
     vocab_size: int
     high_level_cycles: int
     low_level_cycles: int
@@ -45,6 +47,7 @@ class RMSNorm(nn.Module):
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim: int, max_length: int, base: float, dtype: torch.dtype):
         super().__init__()
+        self.max_length = max_length
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=dtype) / dim))
         t = torch.arange(max_length, dtype=dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
@@ -58,8 +61,19 @@ class RotaryPositionEmbedding(nn.Module):
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    def forward(self, x):
-        return (x * self.cos) + (self._rotate_half(x) * self.sin)
+    def forward(self, x, length=None):
+        # Support variable length inputs
+        if length is None:
+            length = x.shape[1]
+        
+        if length <= self.max_length:
+            cos = self.cos[:, :length, :]
+            sin = self.sin[:, :length, :]
+        else:
+            # For longer sequences, compute on the fly
+            raise ValueError(f"Sequence length {length} exceeds max length {self.max_length}")
+        
+        return (x * cos) + (self._rotate_half(x) * sin)
 
 class Attention(nn.Module):
     def __init__(self, dim: int, num_heads: int, head_dim: int):
@@ -71,15 +85,18 @@ class Attention(nn.Module):
         self.qkv_proj = nn.Linear(dim, (num_heads * 2 + num_heads) * head_dim, bias=False)
         self.out_proj = nn.Linear(num_heads * head_dim, dim, bias=False)
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, length=None):
         B, L, _ = x.shape
+        if length is None:
+            length = L
+            
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, L, self.num_heads * 3, self.head_dim)
 
         query, key, value = qkv.split([self.num_heads, self.num_heads, self.num_heads], dim=2)
 
-        query = rope(query)
-        key = rope(key)
+        query = rope(query, length)
+        key = rope(key, length)
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
@@ -115,10 +132,10 @@ class HRMACTBlock(nn.Module):
         self.norm1 = RMSNorm(eps=config.norm_epsilon)
         self.norm2 = RMSNorm(eps=config.norm_epsilon)
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, length=None):
         # FIX: Apply Post-LayerNorm, matching the original Swift implementation
         # The input 'x' is passed directly to the sub-layers.
-        x = self.norm1(x + self.self_attn(x, rope))
+        x = self.norm1(x + self.self_attn(x, rope, length))
         x = self.norm2(x + self.mlp(x))
         return x
 
@@ -127,10 +144,10 @@ class HRMACTReasoner(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([HRMACTBlock(config) for _ in range(config.num_layers)])
 
-    def forward(self, hidden_state, input_injection, rope):
+    def forward(self, hidden_state, input_injection, rope, length=None):
         hidden_state = hidden_state + input_injection
         for layer in self.layers:
-            hidden_state = layer(hidden_state, rope)
+            hidden_state = layer(hidden_state, rope, length)
         return hidden_state
 
 class HRMACTInner(nn.Module):
@@ -148,7 +165,7 @@ class HRMACTInner(nn.Module):
 
         self.rotary_emb = RotaryPositionEmbedding(
             dim=config.transformers.hidden_size // config.transformers.num_heads,
-            max_length=config.seq_len + 1,
+            max_length=config.max_seq_len + 1,
             base=config.transformers.rope_theta,
             dtype=config.dtype
         )
@@ -181,10 +198,10 @@ class HRMACTInner(nn.Module):
                 # FIX: Initialize bias to 0.0 to encourage exploration
                 nn.init.zeros_(self.q_act_head.bias)
 
-
     def forward(self, hidden_states, inputs):
         low_level_z, high_level_z = hidden_states
         batch_size = inputs.shape[0]
+        input_length = inputs.shape[1]
 
         input_embeddings = self.input_embedding(inputs)
 
@@ -199,13 +216,15 @@ class HRMACTInner(nn.Module):
             low_level_z = self.low_level_reasoner(
                 hidden_state=low_level_z,
                 input_injection=high_level_z + full_embeddings,
-                rope=self.rotary_emb
+                rope=self.rotary_emb,
+                length=input_length + 1  # +1 for class token
             )
             if cycle % self.config.low_level_cycles == 0:
                 high_level_z = self.high_level_reasoner(
                     hidden_state=high_level_z,
                     input_injection=low_level_z,
-                    rope=self.rotary_emb
+                    rope=self.rotary_emb,
+                    length=input_length + 1
                 )
 
         low_level_z = low_level_z.detach()
@@ -214,12 +233,14 @@ class HRMACTInner(nn.Module):
         low_level_z = self.low_level_reasoner(
             hidden_state=low_level_z,
             input_injection=high_level_z + full_embeddings,
-            rope=self.rotary_emb
+            rope=self.rotary_emb,
+            length=input_length + 1
         )
         high_level_z = self.high_level_reasoner(
             hidden_state=high_level_z,
             input_injection=low_level_z,
-            rope=self.rotary_emb
+            rope=self.rotary_emb,
+            length=input_length + 1
         )
 
         output_logits = self.output_head(high_level_z[:, 1:])
