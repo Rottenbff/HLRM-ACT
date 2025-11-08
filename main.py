@@ -11,7 +11,7 @@ from train import TrainingBatch, train_step
 from sudoku import generate_sudoku, Difficulty, sudoku_board_string
 from adam_atan2_pytorch import AdamAtan2 # adam-atan2-pytorch
 
-def train():
+def train(use_sapient=False):
     # Setup device - CUDA if available, otherwise CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -47,7 +47,12 @@ def train():
     optimizer = AdamAtan2(model.parameters(), lr=1e-4, betas=(0.9, 0.95))
 
     # Training batch
-    batch = TrainingBatch(model, batch_size=128, device=device, shard="train[:1%]")
+    if use_sapient:
+        print("Using sapientinc/sudoku-extreme dataset")
+        batch = TrainingBatch(model, batch_size=128, device=device, use_sapient=True, subsample_size=1000)
+    else:
+        print("Using Ritvik19/Sudoku-Dataset")
+        batch = TrainingBatch(model, batch_size=128, device=device, shard="train[:1%]")
 
     step_idx = 0
     steps_since_graduation = 0
@@ -173,6 +178,8 @@ if __name__ == "__main__":
 
     # Train command
     parser_train = subparsers.add_parser("train", help="Train the model")
+    parser_train.add_argument("--use-sapient", action="store_true",
+                              help="Use sapientinc/sudoku-extreme dataset instead of Ritvik19")
 
     # Infer command
     parser_infer = subparsers.add_parser("infer", help="Run inference with a trained model")
@@ -185,6 +192,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "train":
-        train()
+        train(use_sapient=getattr(args, 'use_sapient', False))
     elif args.command == "infer":
         infer(args.checkpoint, args.difficulty, args.turns, args.verbose)
+
+
+def train(use_sapient=False):

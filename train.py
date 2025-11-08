@@ -83,13 +83,25 @@ class TrainingBatch:
         num_proc = max(1,  total_cores - 1)
         return self.dataset.filter(lambda example: example['missing'] == key, num_proc=num_proc)
 
-    def __init__(self, model: HRMACTInner, batch_size: int, device: torch.device, shard: str = None):
+    def __init__(self, model: HRMACTInner, batch_size: int, device: torch.device, shard: str = None, use_sapient: bool = False, subsample_size: int = None):
         self.model = model
         self.batch_size = batch_size
         self.device = device
         self.curriculum_level = 0
         self.total_puzzles = 0
-        if shard is None:
+
+        if use_sapient:
+            print("Using sapientinc/sudoku-extreme dataset with augmentation")
+            self.dataset = load_sapient_sudoku_dataset(
+                subset="train",
+                num_augment=1000,
+                subsample_size=subsample_size,
+                min_difficulty=1
+            )
+            self.levels = ["extreme"]  # All puzzles are extreme difficulty
+            self.puzzle_pool = self.dataset
+            self.sample_puzzle = self._sample_puzzle_from_dataset
+        elif shard is None:
             print("Sample puzzle from algorithm")
             self.sample_puzzle = self._sample_puzzle_from_algorithm
         else:

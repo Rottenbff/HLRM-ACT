@@ -190,6 +190,120 @@ def load_online_puzzle(shard: str, batch_size: int = 1_000, num_proc: int = None
     return ds
 
 
+def shuffle_sudoku(board: np.ndarray, solution: np.ndarray, rng=None):
+    """
+    Apply Sudoku augmentation transformations.
+
+    Transformations:
+    - Random digit mapping (permutation of 1..9)
+    - Random transposition
+    - Row band shuffling (3 bands × 3 rows each)
+    - Column stack shuffling (3 stacks × 3 columns each)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
+    digit_map = np.pad(rng.permutation(np.arange(1, 10)), (1, 0))
+
+    # Randomly decide whether to transpose
+    transpose_flag = rng.random() < 0.5
+
+    # Generate a valid row permutation:
+    # - Shuffle the 3 bands (each band = 3 rows) and for each band, shuffle its 3 rows.
+    bands = rng.permutation(3)
+    row_perm = np.concatenate([b * 3 + rng.permutation(3) for b in bands])
+
+    # Similarly for columns (stacks)
+    stacks = rng.permutation(3)
+    col_perm = np.concatenate([s * 3 + rng.permutation(3) for s in stacks])
+
+    # Build an 81->81 mapping
+    mapping = np.array([row_perm[i // 9] * 9 + col_perm[i % 9] for i in range(81)])
+
+    def apply_transformation(x: np.ndarray) -> np.ndarray:
+        # Apply transpose flag
+        if transpose_flag:
+            x = x.T
+        # Apply the position mapping
+        new_board = x.flatten()[mapping].reshape(9, 9).copy()
+        # Apply digit mapping
+        return digit_map[new_board]
+
+    return apply_transformation(board), apply_transformation(solution)
+
+
+def load_sapient_sudoku_dataset(
+    subset: str = "train",
+    num_augment: int = 1000,
+    subsample_size: int = None,
+    min_difficulty: int = None,
+) -> list:
+    """
+    Load Sudoku dataset from sapientinc/sudoku-extreme with augmentation.
+    This replicates the exact logic from HRM's build_sudoku_dataset.py
+
+    Args:
+        subset: 'train' or 'test'
+        num_augment: Number of augmentations (0 for test, 1000 for train)
+        subsample_size: Randomly sample this many examples
+        min_difficulty: Minimum difficulty rating
+
+    Returns:
+        List of examples with 'puzzle' and 'solution' fields
+    """
+    import csv
+    from huggingface_hub import hf_hub_download
+
+    # Read CSV using exact HRM logic
+    inputs = []
+    labels = []
+
+    print(f"[INFO] Loading {subset} split from sapientinc/sudoku-extreme...")
+    csv_path = hf_hub_download("sapientinc/sudoku-extreme", f"{subset}.csv", repo_type="dataset")
+
+    with open(csv_path, newline="") as csvfile:
+        reader = csv.reader(csvfile)
+        next(reader)  # Skip header
+        for source, q, a, rating in reader:
+            if (min_difficulty is None) or (int(rating) >= min_difficulty):
+                assert len(q) == 81 and len(a) == 81
+
+                # Convert puzzle (replace '.' with '0') and solution using exact HRM logic
+                puzzle = np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+                solution = np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0')
+                inputs.append(puzzle)
+                labels.append(solution)
+
+    print(f"[INFO] Loaded {len(inputs)} examples")
+
+    # If subsample_size is specified for the training set
+    if subset == "train" and subsample_size is not None and subsample_size < len(inputs):
+        print(f"[INFO] Subsampling to {subsample_size} examples")
+        indices = np.random.choice(len(inputs), size=subsample_size, replace=False)
+        inputs = [inputs[i] for i in indices]
+        labels = [labels[i] for i in indices]
+
+    # Generate dataset with augmentations using exact HRM logic
+    num_augments = num_augment if subset == "train" else 0
+
+    results = []
+    for orig_inp, orig_out in zip(inputs, labels):
+        for aug_idx in range(1 + num_augments):
+            # First index is not augmented
+            if aug_idx == 0:
+                inp, out = orig_inp, orig_out
+            else:
+                inp, out = shuffle_sudoku(orig_inp, orig_out)
+
+            results.append({
+                "puzzle": inp,
+                "solution": out
+            })
+
+    print(f"[INFO] Total examples after augmentation: {len(results)}")
+    return results
+
 
 def sudoku_board_string(board):
     horizontal_line = "+-------+-------+-------+"
